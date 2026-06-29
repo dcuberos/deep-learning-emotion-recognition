@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+
+# Modelos e resultados gerados
+models/
+results/
+
+# Dados pesados (arrays e anotações geradas)
+data/emotic/img_arrs/
+data/emotic/img_arrs_noface/
+data/emotic/annotations.json
+data/crops/
+data/processed/
+
+# Sistema
+.DS_Store
+Thumbs.db
