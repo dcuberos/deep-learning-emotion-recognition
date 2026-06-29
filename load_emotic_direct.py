@@ -1,100 +1,56 @@
 """
-Carrega o dataset EMOTIC diretamente dos ficheiros .npy
-SEM necessidade de conversão para JPG!
+Carrega o dataset EMOTIC diretamente dos ficheiros .npy (sem conversão para JPG).
+
+Gera data/emotic/annotations.json com, para cada crop:
+  - image_path: caminho completo do .npy (array RGB 224x224x3, uint8)
+  - labels:     vetor multi-hot de dimensão 26 (ordem de config.EMOTIONS)
+  - emotions:   lista legível das emoções presentes
+  - split:      'train' | 'val' | 'test'  (splits oficiais do EMOTIC)
+
+NOTA: o EMOTIC é multi-etiqueta. Mantemos TODAS as emoções de cada pessoa
+(não apenas a primeira) e descartamos crops sem qualquer emoção anotada
+(em vez de inventar uma etiqueta aleatória).
 """
 
 import os
-import sys
-import pandas as pd
-import numpy as np
 import json
-from pathlib import Path
+import numpy as np
+import pandas as pd
 
-print("="*70)
-print(" CARREGAMENTO DIRETO DO EMOTIC (SEM CONVERSÃO)")
-print("="*70)
-print()
+from config import EMOTIONS
 
-# Detectar diretório do projeto
+print("=" * 70)
+print(" CARREGAMENTO DIRETO DO EMOTIC (MULTI-ETIQUETA, SEM CONVERSÃO)")
+print("=" * 70)
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = current_dir
-
-print(f" Diretório atual: {current_dir}")
-print(f" Diretório do projeto: {project_root}")
-
-# Caminhos
-EMOTIC_ROOT = os.path.join(project_root, "data", "emotic")
+EMOTIC_ROOT = os.path.join(current_dir, "data", "emotic")
 IMG_ARRS_DIR = os.path.join(EMOTIC_ROOT, "img_arrs")
 
-print(f" EMOTIC_ROOT: {EMOTIC_ROOT}")
 print(f" IMG_ARRS_DIR: {IMG_ARRS_DIR}")
 print(f" IMG_ARRS existe? {os.path.exists(IMG_ARRS_DIR)}")
-print()
 
-# Emoções
-EMOTIONS = [
-    'Peace', 'Affection', 'Esteem', 'Anticipation', 'Engagement',
-    'Confidence', 'Happiness', 'Pleasure', 'Excitement', 'Surprise',
-    'Sympathy', 'Doubt', 'Disconnection', 'Fatigue', 'Embarrassment',
-    'Yearning', 'Disapproval', 'Aversion', 'Annoyance', 'Anger',
-    'Sensitivity', 'Sadness', 'Disquietment', 'Fear', 'Pain', 'Suffering'
-]
 
 def process_split(csv_path, split_name):
-    """Processa um split (train/val/test)"""
-
+    """Processa um split (train/val/test) e devolve a lista de anotações."""
     if not os.path.exists(csv_path):
         print(f" Não encontrado: {csv_path}")
         return []
 
     print(f"\n Processando {split_name}...")
     df = pd.read_csv(csv_path)
-    print(f"  Total: {len(df)} amostras")
+    print(f"  Total no CSV: {len(df)} amostras")
 
-    # DEBUG: mostrar primeira linha
-    if len(df) > 0:
-        print(f"\n   DEBUG - Primeira linha:")
-        first_row = df.iloc[0]
-        print(f"    Crop_name: '{first_row.get('Crop_name', 'N/A')}'")
-        print(f"    Arr_name: '{first_row.get('Arr_name', 'N/A')}'")
-
-        # Verificar se Crop_name existe
-        crop_test = str(first_row.get('Crop_name', ''))
-        full_path = os.path.join(IMG_ARRS_DIR, crop_test)
-        print(f"    Caminho construído: {full_path}")
-        print(f"    Existe? {os.path.exists(full_path)}")
-
-        # Listar o que está em img_arrs
-        if os.path.exists(IMG_ARRS_DIR):
-            files = os.listdir(IMG_ARRS_DIR)
-            print(f"\n   Ficheiros em img_arrs: {len(files)} ficheiros")
-            if len(files) > 0:
-                print(f"    Primeiros 10: {files[:10]}")
-
-                # Verificar se crop_arr_train_0.npy existe
-                if 'crop_arr_train_0.npy' in files:
-                    print(f"     crop_arr_train_0.npy EXISTE!")
-                else:
-                    print(f"     crop_arr_train_0.npy NÃO EXISTE")
-
-                # Procurar padrões
-                train_files = [f for f in files if 'train' in f.lower()]
-                val_files = [f for f in files if 'val' in f.lower()]
-                test_files = [f for f in files if 'test' in f.lower()]
-
-                print(f"\n   Ficheiros por tipo:")
-                print(f"    Train: {len(train_files)} (exemplos: {train_files[:3]})")
-                print(f"    Val: {len(val_files)} (exemplos: {val_files[:3]})")
-                print(f"    Test: {len(test_files)} (exemplos: {test_files[:3]})")
-        else:
-            print(f"   Pasta não existe: {IMG_ARRS_DIR}")
+    # Colunas de emoção realmente presentes no CSV
+    present_cols = [c for c in EMOTIONS if c in df.columns]
+    missing_cols = [c for c in EMOTIONS if c not in df.columns]
+    if missing_cols:
+        print(f"   Colunas de emoção em falta no CSV: {missing_cols}")
 
     annotations = []
-    found = 0
-    missing = 0
+    found = missing = no_label = 0
 
-    for idx, row in df.iterrows():
-        # Obter caminho do .npy
+    for _, row in df.iterrows():
         crop_name = str(row.get('Crop_name', ''))
         npy_path = os.path.join(IMG_ARRS_DIR, crop_name)
 
@@ -102,39 +58,28 @@ def process_split(csv_path, split_name):
             missing += 1
             continue
 
-        # Extrair emoção principal
-        emotion = None
-        for emo in EMOTIONS:
-            col_name = emo.replace('/', '')  # Doubt/Confusion -> Doubt
-            if col_name in df.columns:
-                try:
-                    if int(row[col_name]) == 1:
-                        emotion = emo
-                        break
-                except:
-                    pass
+        # Vetor multi-hot na ordem de EMOTIONS
+        labels = [int(float(row[c])) if c in present_cols and not pd.isna(row[c]) else 0
+                  for c in EMOTIONS]
 
-        if emotion is None:
-            emotion = np.random.choice(EMOTIONS)
+        if sum(labels) == 0:
+            # Sem qualquer emoção anotada -> descartar (não inventar)
+            no_label += 1
+            continue
 
-        # Criar anotação (usar caminho .npy diretamente!)
-        annotation = {
-            'image_path': npy_path,  # Caminho COMPLETO do .npy
-            'emotion': emotion,
-            'bbox': [0, 0, int(row.get('Width', 224)), int(row.get('Height', 224))]
-        }
+        emotions_present = [emo for emo, v in zip(EMOTIONS, labels) if v == 1]
 
-        annotations.append(annotation)
+        annotations.append({
+            'image_path': npy_path,
+            'labels': labels,
+            'emotions': emotions_present,
+            'split': split_name,
+        })
         found += 1
 
-    print(f"   Encontrados: {found}")
-    if missing > 0:
-        print(f"   Faltando: {missing}")
-
+    print(f"   Válidos: {found}  |  Ficheiro .npy em falta: {missing}  |  Sem emoção: {no_label}")
     return annotations
 
-# Processar todos os splits
-all_annotations = []
 
 csv_files = [
     (os.path.join(EMOTIC_ROOT, "annot_arrs_train.csv"), "train"),
@@ -142,35 +87,33 @@ csv_files = [
     (os.path.join(EMOTIC_ROOT, "annot_arrs_test.csv"), "test"),
 ]
 
+all_annotations = []
 for csv_path, split_name in csv_files:
-    annotations = process_split(csv_path, split_name)
-    all_annotations.extend(annotations)
+    all_annotations.extend(process_split(csv_path, split_name))
 
-# Salvar
 if all_annotations:
     output_json = os.path.join(EMOTIC_ROOT, "annotations.json")
     with open(output_json, 'w') as f:
-        json.dump(all_annotations, f, indent=2)
+        json.dump(all_annotations, f)
 
-    print(f"\n{'='*70}")
-    print(f"  CARREGAMENTO CONCLUÍDO")
-    print(f"{'='*70}")
-    print(f"\n Total de anotações: {len(all_annotations)}")
+    print(f"\n{'=' * 70}")
+    print(" CARREGAMENTO CONCLUÍDO")
+    print(f"{'=' * 70}")
+    print(f" Total de anotações: {len(all_annotations)}")
     print(f" Ficheiro criado: {output_json}")
 
-    # Estatísticas
-    emotions_count = {}
-    for ann in all_annotations:
-        emotion = ann['emotion']
-        emotions_count[emotion] = emotions_count.get(emotion, 0) + 1
+    # Estatística de frequência por emoção (contagem multi-hot)
+    counts = np.sum([a['labels'] for a in all_annotations], axis=0)
+    order = np.argsort(counts)[::-1]
+    print("\n Frequência por emoção (top 10):")
+    for i in order[:10]:
+        print(f"  {EMOTIONS[i]}: {int(counts[i])}")
 
-    print(f"\n Distribuição de emoções (top 10):")
-    sorted_emotions = sorted(emotions_count.items(), key=lambda x: x[1], reverse=True)
-    for emotion, count in sorted_emotions[:10]:
-        print(f"  {emotion}: {count}")
+    # Distribuição por split
+    for s in ('train', 'val', 'test'):
+        n = sum(1 for a in all_annotations if a['split'] == s)
+        print(f"  Split {s}: {n}")
 
-    print(f"\n Agora pode executar: python train.py")
-    print(f"\n NOTA: O data_loader foi atualizado para ler .npy diretamente!")
-
+    print("\n Agora pode executar: python train.py")
 else:
     print("\n Nenhuma anotação processada!")

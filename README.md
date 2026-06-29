@@ -23,27 +23,37 @@ Sistema de classificacao de emocoes baseado exclusivamente em posturas corporais
 - Extracao de bounding boxes individuais
 - Normalizacao para 224x224 pixels
 
+### Formulacao do problema
+O EMOTIC e **multi-etiqueta**: cada pessoa pode exibir varias das 26 emocoes
+em simultaneo. Por isso o modelo usa ativacao **sigmoid** (26 saidas
+independentes) e **Binary Focal Crossentropy** (com `apply_class_balancing`),
+e nao softmax + categorical crossentropy.
+
 ### Modelo
-- **Arquitetura:** ResNet50 com Transfer Learning
-- **Parametros:** ~24M total (~2M treinaveis)
-- **Configuracao:**
-  - Otimizador: Adam (lr=0.001)
-  - Epocas: 20
-  - Batch size: 32
-  - Loss: Categorical Crossentropy
+- **Arquitetura:** ResNet50 com Transfer Learning (configuravel em `config.py`:
+  `resnet50` | `efficientnet` | `custom`)
+- **Pre-processamento:** `resnet50.preprocess_input` (o esperado pelos pesos
+  ImageNet), nao um simples `/255`
+- **Treino em 2 fases:**
+  - Fase 1 — cabeca (base congelada), Adam lr=1e-3, 15 epocas
+  - Fase 2 — fine-tuning do topo da base, Adam lr=1e-5, 25 epocas
+- **Loss:** Binary Focal Crossentropy (mitiga o desbalanceamento severo)
+- **Splits:** os splits oficiais train/val/test do EMOTIC sao respeitados
+- **Batch size:** 32
+- **Metricas:** AUC (multi-label), Precision, Recall durante o treino;
+  mAP, F1 (macro/micro) e AP por classe na avaliacao
 
 ## Estrutura do Projeto
 
 ```
 .
-├── config.py                  # Configuracoes globais
-├── data_loader.py            # Carregamento e geradores de dados
-├── cnn_models.py             # Definicao da arquitetura ResNet50
+├── config.py                  # Configuracoes globais e lista de emocoes (multi-hot)
+├── load_emotic_direct.py     # Gera annotations.json (multi-etiqueta, splits oficiais)
+├── data_loader.py            # Geradores de dados (.npy + preprocess por backbone)
+├── cnn_models.py             # Arquiteturas, focal loss e fine-tuning em 2 fases
 ├── face_removal.py           # Remocao de rostos (MediaPipe/OpenCV)
-├── training.py               # Logica de treino
-├── evaluation.py             # Metricas e avaliacao
-├── train.py                  # Script principal de treino
-├── load_emotic_direct.py     # Carregamento do dataset EMOTIC
+├── evaluation.py             # Metricas multi-etiqueta (mAP, F1, AP por classe)
+├── train.py                  # Script principal de treino (ponto de entrada)
 ├── visualize_emotic.py       # Visualizacao do dataset
 └── requirements.txt          # Dependencias
 ```
@@ -71,34 +81,33 @@ python train.py
 
 ## Resultados
 
-### Metricas Globais
-- **Accuracy:** 30.42%
-- **F1-Score (Macro):** 0.0179
-- **F1-Score (Weighted):** 0.1419
+> **Nota:** os resultados anteriores (Accuracy 30.42%, F1-macro 0.0179) foram
+> obtidos com um pipeline que continha bugs criticos — em particular, as
+> imagens `.npy` eram lidas com `cv2.imread`, que nao le esse formato, pelo
+> que **o modelo treinava com imagens completamente pretas** e colapsava na
+> classe maioritaria (Engagement). Esses valores foram removidos por nao
+> serem representativos. Apos as correcoes, reexecutar `python train.py`
+> para obter as novas metricas (mAP, F1 macro/micro, AP por classe), guardadas
+> em `results/`.
 
-### Analise
-O modelo apresentou overfitting extremo para a classe majoritaria (Engagement), classificando praticamente todas as amostras nesta categoria. Das 26 emocoes, apenas Engagement foi aprendida (Recall: 1.0, Precision: 0.3042).
-
-### Causas da Baixa Performance
-1. **Desbalanceamento severo** (ratio 30:1) sem tecnicas de mitigacao
-2. **Epocas insuficientes** (20) para convergencia adequada
-3. **Complexidade da tarefa** (26 categorias apenas por posturas corporais)
+### Correcoes aplicadas (face as causas da baixa performance)
+1. **Imagens pretas** — `data_loader` passa a ler `.npy` com `np.load`
+2. **Etiquetas aleatorias** — crops sem emocao sao descartados (nao inventados)
+3. **Multi-etiqueta** — sigmoid + Binary Focal Crossentropy em vez de softmax
+4. **Pre-processamento** — `preprocess_input` da backbone em vez de `/255`
+5. **Desbalanceamento** — focal loss com balanceamento de classes
+6. **Treino** — 2 fases (cabeca + fine-tuning), mais epocas, splits oficiais
+7. **Metricas honestas** — mAP e AP por classe em vez de accuracy global
 
 ## Limitacoes e Trabalho Futuro
 
-### Limitacoes Identificadas
-- Apenas 20 epocas de treino
-- Sem tecnicas de balanceamento (class weights, SMOTE)
-- Ausencia de comparacao com outras arquiteturas
-- Sem informacao temporal (apenas imagens estaticas)
-
-### Recomendacoes
-1. Aumentar epocas (50-100+) e aplicar class weights
-2. Reduzir numero de classes para emocoes basicas (6-8)
-3. Comparar multiplas arquiteturas (CNN custom, EfficientNet)
-4. Incorporar informacao temporal (video)
-5. Usar keypoints de pose (OpenPose/MediaPipe Pose)
-6. Testar em outros datasets (BodyTalk, HAPPEI)
+### Trabalho futuro
+1. **Remocao facial no pipeline `.npy`** — `face_removal.py` so e aplicado ao
+   caminho antigo de crops JPG; falta aplica-lo (em cache) aos arrays `.npy`
+2. Usar **keypoints de pose** (MediaPipe Pose) em vez da imagem crua
+3. Incorporar informacao **temporal** (video)
+4. Testar noutros datasets (BodyTalk, HAPPEI)
+5. Ajustar o **limiar** de decisao por classe (em vez de 0.5 global)
 
 ## Implicacoes Eticas
 
@@ -110,11 +119,12 @@ O modelo apresentou overfitting extremo para a classe majoritaria (Engagement), 
 ## Ficheiros Gerados
 
 Apos execucao do treino:
-- `models/emotion_resnet50_final.h5` - Modelo treinado
-- `models/label_encoder.pkl` - Encoder de labels
-- `results/confusion_matrix.png` - Matriz de confusao
-- `results/classification_report.txt` - Relatorio detalhado
-- `results/training_history.png` - Curvas de treino
+- `models/emotion_<backbone>_final.keras` - Modelo treinado (formato nativo Keras)
+- `models/emotions.json` - Ordem das 26 emocoes (alinhada com os vetores multi-hot)
+- `results/training_history.png` - Curvas de treino (loss/AUC/precision/recall)
+- `results/ap_per_class.png` - Average Precision por emocao
+- `results/classification_report.txt` - Relatorio multi-etiqueta detalhado
+- `results/ap_per_class.csv` - AP e suporte por emocao
 
 ## Referencia
 

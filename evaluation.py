@@ -1,290 +1,119 @@
 """
-Módulo para avaliação de modelos
+Avaliação multi-etiqueta de modelos EMOTIC.
+
+Métricas honestas para o problema:
+  - mAP (mean Average Precision) macro e micro -> métrica de referência no EMOTIC.
+  - AP por classe -> mostra quais emoções o modelo realmente aprende.
+  - F1 / Precision / Recall (macro e micro) a um limiar configurável.
+
+NOTA: "accuracy" e matriz de confusão multiclasse não se aplicam a um
+problema multi-etiqueta e por isso não são usadas aqui.
 """
 
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-import cv2
-from sklearn.metrics import classification_report, confusion_matrix, f1_score, accuracy_score
+from sklearn.metrics import (
+    average_precision_score, f1_score, precision_score, recall_score,
+    classification_report,
+)
 
-# Importar módulos necessários
-try:
-    from config import CONFIG
-except ImportError:
-    CONFIG = {'img_height': 224, 'img_width': 224, 'batch_size': 32}
-    print(" config.py não encontrado, usando configuração padrão")
-
-try:
-    from data_loader import EmotionDataGenerator
-except ImportError as e:
-    print(f" Erro ao importar EmotionDataGenerator: {e}")
-    EmotionDataGenerator = None
+from config import CONFIG, EMOTIONS
+from data_loader import EmotionDataGenerator
 
 
 class ModelEvaluator:
-    """Classe para avaliar modelos treinados"""
+    """Avalia um modelo multi-etiqueta treinado."""
 
-    def __init__(self, model, label_encoder):
+    def __init__(self, model, class_names=None, threshold=None):
         self.model = model
-        self.label_encoder = label_encoder
-        self.class_names = label_encoder.classes_
+        self.class_names = list(class_names) if class_names is not None else list(EMOTIONS)
+        self.threshold = threshold if threshold is not None else CONFIG['classification_threshold']
 
-    def evaluate(self, X_test, y_test, batch_size=32):
-        """
-        Avalia o modelo no conjunto de teste
-
-        Args:
-            X_test: caminhos das imagens de teste
-            y_test: labels de teste
-            batch_size: tamanho do batch
-
-        Returns:
-            dicionário com métricas
-        """
-        print("\n" + "="*60)
-        print("AVALIAÇÃO NO CONJUNTO DE TESTE")
-        print("="*60 + "\n")
-
-        # Criar gerador de teste
-        img_size = (CONFIG['img_height'], CONFIG['img_width'])
-        test_gen = EmotionDataGenerator(
-            X_test, y_test,
-            batch_size=batch_size,
-            img_size=img_size,
-            augment=False
+    def predict(self, X_paths, y_true, batch_size=32):
+        gen = EmotionDataGenerator(
+            X_paths, y_true, batch_size=batch_size,
+            img_size=(CONFIG['img_height'], CONFIG['img_width']),
+            backbone=CONFIG['backbone'], augment=False, shuffle=False,
         )
+        y_probs = self.model.predict(gen, verbose=1)
+        return y_probs
 
-        # Fazer predições
-        y_pred_probs = self.model.predict(test_gen, verbose=1)
-        y_pred = np.argmax(y_pred_probs, axis=1)
+    def evaluate(self, X_paths, y_true, batch_size=32, save_dir='results'):
+        os.makedirs(save_dir, exist_ok=True)
+        y_true = np.asarray(y_true, dtype=np.float32)
+        y_probs = self.predict(X_paths, y_true, batch_size)
+        y_pred = (y_probs >= self.threshold).astype(int)
 
-        # Calcular métricas
-        accuracy = accuracy_score(y_test, y_pred)
-        f1_macro = f1_score(y_test, y_pred, average='macro')
-        f1_weighted = f1_score(y_test, y_pred, average='weighted')
+        # mAP (não depende de limiar)
+        map_macro = average_precision_score(y_true, y_probs, average='macro')
+        map_micro = average_precision_score(y_true, y_probs, average='micro')
 
-        print(f"\nRESULTADOS:")
-        print(f"  Accuracy: {accuracy:.4f}")
-        print(f"  F1-Score (Macro): {f1_macro:.4f}")
-        print(f"  F1-Score (Weighted): {f1_weighted:.4f}")
+        # Métricas a limiar fixo
+        f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+        f1_micro = f1_score(y_true, y_pred, average='micro', zero_division=0)
+        prec_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        rec_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
 
-        metrics = {
-            'accuracy': accuracy,
-            'f1_macro': f1_macro,
-            'f1_weighted': f1_weighted,
-            'y_true': y_test,
-            'y_pred': y_pred,
-            'y_pred_probs': y_pred_probs
+        print("\n" + "=" * 60)
+        print(" RESULTADOS (multi-etiqueta)")
+        print("=" * 60)
+        print(f"  mAP (macro):   {map_macro:.4f}")
+        print(f"  mAP (micro):   {map_micro:.4f}")
+        print(f"  F1  (macro):   {f1_macro:.4f}")
+        print(f"  F1  (micro):   {f1_micro:.4f}")
+        print(f"  Precision (macro): {prec_macro:.4f}")
+        print(f"  Recall    (macro): {rec_macro:.4f}")
+
+        # AP por classe
+        ap_per_class = average_precision_score(y_true, y_probs, average=None)
+        self._save_per_class_report(y_true, y_pred, ap_per_class, save_dir)
+        self._plot_ap_per_class(ap_per_class, save_dir)
+
+        return {
+            'map_macro': map_macro, 'map_micro': map_micro,
+            'f1_macro': f1_macro, 'f1_micro': f1_micro,
+            'precision_macro': prec_macro, 'recall_macro': rec_macro,
+            'ap_per_class': ap_per_class,
+            'y_true': y_true, 'y_pred': y_pred, 'y_probs': y_probs,
         }
 
-        return metrics
-
-    def plot_confusion_matrix(self, y_true, y_pred, save_path=None):
-        """
-        Plota matriz de confusão
-
-        Args:
-            y_true: labels verdadeiros
-            y_pred: labels preditos
-            save_path: caminho para salvar figura
-        """
-        cm = confusion_matrix(y_true, y_pred)
-
-        plt.figure(figsize=(20, 16))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=self.class_names,
-                   yticklabels=self.class_names)
-        plt.title('Matriz de Confusão', fontsize=16)
-        plt.ylabel('Classe Verdadeira', fontsize=12)
-        plt.xlabel('Classe Predita', fontsize=12)
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-
-        if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f" Matriz de confusão salva em {save_path}")
-
-        plt.show()
-
-    def classification_report_detailed(self, y_true, y_pred, save_path=None):
-        """
-        Gera relatório de classificação detalhado
-
-        Args:
-            y_true: labels verdadeiros
-            y_pred: labels preditos
-            save_path: caminho para salvar relatório
-        """
+    def _save_per_class_report(self, y_true, y_pred, ap_per_class, save_dir):
         report = classification_report(
-            y_true, y_pred,
-            target_names=self.class_names,
-            digits=4
+            y_true, y_pred, target_names=self.class_names,
+            digits=4, zero_division=0,
         )
+        ap_df = pd.DataFrame({
+            'emotion': self.class_names,
+            'support': y_true.sum(axis=0).astype(int),
+            'average_precision': ap_per_class,
+        }).sort_values('average_precision', ascending=False)
 
-        print("\n" + "="*60)
-        print("RELATÓRIO DE CLASSIFICAÇÃO")
-        print("="*60)
-        print(report)
+        path = os.path.join(save_dir, 'classification_report.txt')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("RELATÓRIO DE CLASSIFICAÇÃO MULTI-ETIQUETA\n")
+            f.write("=" * 60 + "\n\n")
+            f.write(f"Limiar: {self.threshold}\n\n")
+            f.write(report + "\n\n")
+            f.write("Average Precision por emoção (ordenado):\n")
+            f.write(ap_df.to_string(index=False))
+        print(f" Relatório salvo em {path}")
+        ap_df.to_csv(os.path.join(save_dir, 'ap_per_class.csv'), index=False)
 
-        if save_path:
-            with open(save_path, 'w') as f:
-                f.write("RELATÓRIO DE CLASSIFICAÇÃO\n")
-                f.write("="*60 + "\n")
-                f.write(report)
-            print(f" Relatório salvo em {save_path}")
-
-        return report
-
-    def analyze_errors(self, X_test, y_true, y_pred, n_samples=10):
-        """
-        Analisa erros de classificação
-
-        Args:
-            X_test: caminhos das imagens de teste
-            y_true: labels verdadeiros
-            y_pred: labels preditos
-            n_samples: número de amostras a visualizar
-        """
-        # Encontrar erros
-        error_indices = np.where(y_true != y_pred)[0]
-
-        if len(error_indices) == 0:
-            print("Nenhum erro encontrado!")
-            return
-
-        print(f"\nTotal de erros: {len(error_indices)}/{len(y_true)}")
-        print(f"Taxa de erro: {len(error_indices)/len(y_true)*100:.2f}%")
-
-        # Visualizar alguns erros
-        n_show = min(n_samples, len(error_indices))
-        sample_indices = np.random.choice(error_indices, n_show, replace=False)
-
-        fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-        axes = axes.ravel()
-
-        for i, idx in enumerate(sample_indices):
-            img = cv2.imread(X_test[idx])
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            true_label = self.class_names[y_true[idx]]
-            pred_label = self.class_names[y_pred[idx]]
-
-            axes[i].imshow(img)
-            axes[i].set_title(f'Real: {true_label}\nPredito: {pred_label}',
-                            fontsize=10)
-            axes[i].axis('off')
-
+    def _plot_ap_per_class(self, ap_per_class, save_dir):
+        order = np.argsort(ap_per_class)
+        names = [self.class_names[i] for i in order]
+        plt.figure(figsize=(10, 9))
+        plt.barh(names, ap_per_class[order], color='steelblue')
+        plt.xlabel('Average Precision')
+        plt.title('AP por emoção')
         plt.tight_layout()
-        plt.savefig('results/error_analysis.png', dpi=300, bbox_inches='tight')
-        plt.show()
-
-    def plot_top_predictions(self, X_test, y_pred_probs, n_samples=10):
-        """
-        Visualiza predições com maior confiança
-
-        Args:
-            X_test: caminhos das imagens de teste
-            y_pred_probs: probabilidades preditas
-            n_samples: número de amostras
-        """
-        # Top predições por confiança
-        max_probs = np.max(y_pred_probs, axis=1)
-        top_indices = np.argsort(max_probs)[-n_samples:][::-1]
-
-        fig, axes = plt.subplots(2, 5, figsize=(20, 8))
-        axes = axes.ravel()
-
-        for i, idx in enumerate(top_indices):
-            img = cv2.imread(X_test[idx])
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-            pred_idx = np.argmax(y_pred_probs[idx])
-            pred_label = self.class_names[pred_idx]
-            confidence = y_pred_probs[idx][pred_idx]
-
-            axes[i].imshow(img)
-            axes[i].set_title(f'{pred_label}\nConfiança: {confidence:.2%}',
-                            fontsize=10)
-            axes[i].axis('off')
-
-        plt.tight_layout()
-        plt.savefig('results/top_predictions.png', dpi=300, bbox_inches='tight')
-        plt.show()
+        path = os.path.join(save_dir, 'ap_per_class.png')
+        plt.savefig(path, dpi=200, bbox_inches='tight')
+        plt.close()
+        print(f" Gráfico AP por classe salvo em {path}")
 
 
-def compare_models(models_dict, X_test, y_test, label_encoder):
-    """
-    Compara múltiplos modelos
-
-    Args:
-        models_dict: dicionário com modelos treinados
-        X_test, y_test: dados de teste
-        label_encoder: encoder de labels
-
-    Returns:
-        DataFrame com comparação
-    """
-    results = []
-
-    for model_name, trainer in models_dict.items():
-        print(f"\n{'='*60}")
-        print(f"Avaliando: {model_name}")
-        print(f"{'='*60}")
-
-        evaluator = ModelEvaluator(trainer.model, label_encoder)
-        metrics = evaluator.evaluate(X_test, y_test)
-
-        results.append({
-            'Model': model_name,
-            'Accuracy': metrics['accuracy'],
-            'F1-Score (Macro)': metrics['f1_macro'],
-            'F1-Score (Weighted)': metrics['f1_weighted']
-        })
-
-        # Salvar visualizações
-        os.makedirs('results', exist_ok=True)
-        evaluator.plot_confusion_matrix(
-            metrics['y_true'],
-            metrics['y_pred'],
-            save_path=f'results/{model_name}_confusion_matrix.png'
-        )
-
-        evaluator.classification_report_detailed(
-            metrics['y_true'],
-            metrics['y_pred'],
-            save_path=f'results/{model_name}_classification_report.txt'
-        )
-
-    # Criar tabela comparativa
-    comparison_df = pd.DataFrame(results)
-    comparison_df = comparison_df.sort_values('Accuracy', ascending=False)
-
-    print("\n" + "="*60)
-    print("COMPARAÇÃO DE MODELOS")
-    print("="*60)
-    print(comparison_df.to_string(index=False))
-
-    # Salvar comparação
-    comparison_df.to_csv('results/model_comparison.csv', index=False)
-
-    return comparison_df
-
-
-print(" Módulo de avaliação carregado")
-
-# Teste rápido
 if __name__ == "__main__":
-    print("\n" + "="*70)
-    print(" TESTE DO MÓDULO DE AVALIAÇÃO")
-    print("="*70 + "\n")
-
-    print(" ModelEvaluator disponível")
-    print(" Funções de comparação disponíveis")
-    print(" Funções de visualização disponíveis")
-
-    print("\n TESTE PASSOU! Módulo pronto para uso.")
-    print("\n" + "="*70)
+    print(" Módulo de avaliação multi-etiqueta carregado.")

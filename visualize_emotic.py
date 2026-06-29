@@ -7,12 +7,14 @@ Mostra exemplos de diferentes emoções com suas imagens
 # IMPORTS
 # ============================================================================
 
+import os
 import json
 import numpy as np
 import matplotlib.pyplot as plt
-import cv2
 from collections import Counter
 import random
+
+os.makedirs('results', exist_ok=True)
 
 # ============================================================================
 # CONFIGURAÇÃO
@@ -31,8 +33,8 @@ print(f" Total de imagens: {len(annotations)}")
 # ESTATÍSTICAS DO DATASET
 # ============================================================================
 
-# Contar emoções
-emotions = [ann['emotion'] for ann in annotations]
+# Contar emoções (multi-etiqueta: cada anotação pode ter várias)
+emotions = [emo for ann in annotations for emo in ann['emotions']]
 emotion_counts = Counter(emotions)
 
 print(f"\n Distribuição de Emoções:")
@@ -85,8 +87,8 @@ def load_and_display_samples(emotion, num_samples=6):
         num_samples: número de amostras a mostrar
     """
     # Filtrar anotações desta emoção
-    emotion_annotations = [ann for ann in annotations if ann['emotion'] == emotion]
-    
+    emotion_annotations = [ann for ann in annotations if emotion in ann['emotions']]
+
     if len(emotion_annotations) == 0:
         print(f" Nenhuma imagem encontrada para {emotion}")
         return
@@ -155,7 +157,7 @@ axes = axes.ravel()
 for idx, emotion in enumerate(emotions_names):
     try:
         # Pegar uma amostra aleatória desta emoção
-        emotion_annotations = [ann for ann in annotations if ann['emotion'] == emotion]
+        emotion_annotations = [ann for ann in annotations if emotion in ann['emotions']]
         sample = random.choice(emotion_annotations)
         
         # Carregar imagem
